@@ -18,7 +18,9 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from transformers import CLIPTextModelWithProjection, AutoTokenizer
+import transformers
+transformers.logging.set_verbosity_error()
+from transformers import CLIPTextModel, AutoTokenizer
 
 from unet import NaiveUnet
 import os
@@ -132,16 +134,19 @@ def make_dataloader():
             download=True,
             transform=tf,
         )
-        dataloader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=20)
-        return dataloader
+        return DataLoader(dataset, batch_size=128, shuffle=True, num_workers=1)
+
     while True:
         dataloader = _make_dataloader()
         for x, y in dataloader:
             yield x, [label_to_text_prompt(label) for label in y.tolist()]
 
+@torch.no_grad()
 def clip_encode(text, clip_tokenizer, clip_text_model):
     clip_inputs = clip_tokenizer(text=text, return_tensors="pt", padding="max_length", max_length=77, truncation=True)
-    return clip_text_model(**clip_inputs, output_hidden_states=True).hidden_states[-2]
+    for k, v in clip_inputs.items():
+        clip_inputs[k] = v.to(clip_text_model.device)
+    return clip_text_model(**clip_inputs, output_hidden_states=True).hidden_states[-2].float()
 
 def train(
     n_iterations=10_000,
@@ -154,24 +159,32 @@ def train(
 ):
     eps_model = NaiveUnet(in_channels=in_channels, out_channels=in_channels, n_feat=n_feat)
     ddpm = DDPM(eps_model=eps_model, betas=betas, n_T=n_T).to(device)
+    print(f"model has {sum(p.numel() for p in ddpm.parameters())} parameters")
     optim = torch.optim.Adam(ddpm.parameters(), lr=lr)
     dataloader = make_dataloader()
-    clip_text_model = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+    clip_text_model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").to(device).half()
     clip_tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-    for i in range(n_iterations):
+    for i in tqdm(range(n_iterations), disable=True):
         loss_ema = None
         optim.zero_grad()
-        x, y = next(dataloader)
-        x = x.to(device)
-        context = clip_encode(y, clip_tokenizer, clip_text_model)
-        loss = ddpm(x, context)
+        img, text_strings = next(dataloader)
+        img = img.to(device)
+        import time
+        s = time.time()
+        context = clip_encode(text_strings, clip_tokenizer, clip_text_model)
+        torch.cuda.synchronize()
+        print('clip', time.time() -s)
+        s = time.time()
+        loss = ddpm(img, context)
         loss.backward()
+        torch.cuda.synchronize()
+        print('ddpm', time.time() -s)
         if loss_ema is None:
             loss_ema = loss.item()
         else:
             loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
         if i % 100 == 0:
-            print(f"loss: {loss_ema:.4f}")
+            tqdm.write(f"loss: {loss_ema:.4f}")
         optim.step()
 
         if (i+1)%500 == 0:
@@ -192,7 +205,7 @@ def sample(checkpoint_path, device="cuda", n_steps=256, n_per_class=4, eta=0.0):
         ddpm = torch.load(f)
     ddpm.eval()
     
-    clip_text_model = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+    clip_text_model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
     clip_tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
     n_examples = n_per_class * 10

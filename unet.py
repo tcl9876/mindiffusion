@@ -6,29 +6,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import *
-
-try:
-    from flash_attn import flash_attn_func
-except Exception as e:
-    flash_attn_func = None
-
+import einops
 
 def attn_func(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> torch.Tensor:
-    if flash_attn_func is not None:
-        return flash_attn_func(
-            query, key, value, dropout_p=0.0, softmax_scale=None, causal=False
-        )
-    else:
-        attn_weight = query @ key.transpose(-2, -1) / math.sqrt(query.size(-1))
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-        return attn_weight @ value
-
+    attn_weight = query @ key.transpose(-2, -1) / math.sqrt(query.shape[-1])
+    return torch.softmax(attn_weight, dim=-1) @ value
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, num_heads: int=4) -> None:
         super().__init__()
+        assert channels % num_heads == 0
+        self.num_heads = num_heads
         self.q_proj = nn.Linear(channels, channels)
         self.kv_proj = nn.Linear(channels, channels * 2)
         self.o_proj = nn.Linear(channels, channels)
@@ -36,13 +26,23 @@ class MultiHeadAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, context: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        b, c, h, w = x.shape
+        x = einops.rearrange(x, 'b c h w -> b (h w) c')
         q = self.q_proj(x)
         if context is None:
             context = x
         k, v = torch.chunk(self.kv_proj(x), 2, dim=-1)
-        attn_out = attn_func(q, k, v)
-        return self.o_proj(attn_out)
 
+        nh, dh = self.num_heads, q.shape[-1]//self.num_heads
+
+        q = einops.rearrange(q, 'b seq (nh dh) -> b seq nh dh', nh=nh, dh=dh)
+        k = einops.rearrange(k, 'b seq (nh dh) -> b seq nh dh', nh=nh, dh=dh)
+        v = einops.rearrange(v, 'b seq (nh dh) -> b seq nh dh', nh=nh, dh=dh)
+
+        attn_out = attn_func(q, k, v)
+        attn_out = einops.rearrange(attn_out, 'b seq nh dh -> b seq (nh dh)', nh=nh, dh=dh)
+        attn_out = self.o_proj(attn_out)
+        return einops.rearrange(attn_out, 'b (h w) c -> b c h w', h=h, w=w)
 
 class Conv3(nn.Module):
     def __init__(
@@ -82,7 +82,7 @@ class UnetDown(nn.Module):
 
         self.conv = Conv3(in_channels, out_channels)
         self.use_attn = use_attn
-        if use_attn is not None:
+        if use_attn:
             self.self_attn = MultiHeadAttention(out_channels)
             self.cross_attn = MultiHeadAttention(out_channels)
 
@@ -110,7 +110,8 @@ class UnetUp(nn.Module):
             Conv3(out_channels, out_channels),
         ]
         self.model = nn.Sequential(*layers)
-        if use_attn is not None:
+        self.use_attn = use_attn
+        if use_attn:
             self.self_attn = MultiHeadAttention(out_channels)
             self.cross_attn = MultiHeadAttention(out_channels)
 
@@ -158,7 +159,7 @@ class NaiveUnet(nn.Module):
 
         self.to_vec = nn.Sequential(nn.AvgPool2d(4), nn.ReLU())
 
-        self.timeembed = TimeSiren(2 * n_feat)
+        self.timeembed = TimeSiren(n_feat)
 
         self.up0 = nn.Sequential(
             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, 4, 4),
@@ -174,21 +175,21 @@ class NaiveUnet(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor
     ) -> torch.Tensor:
-        x = self.init_conv(x)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            x = self.init_conv(x)
+            temb = self.timeembed(t).view(-1, self.n_feat, 1, 1)
+        
+            down1 = self.down1(x + temb)
+            down2 = self.down2(down1, context)
+            down3 = self.down3(down2, context)
 
-        down1 = self.down1(x)
-        down2 = self.down2(down1, context)
-        down3 = self.down3(down2, context)
+            thro = self.to_vec(down3)
 
-        thro = self.to_vec(down3)
-        temb = self.timeembed(t).view(-1, self.n_feat * 2, 1, 1)
+            thro = self.up0(thro)
 
-        thro = self.up0(thro + temb)
+            up1 = self.up1(thro, down3, context)
+            up2 = self.up2(up1, down2, context)
+            up3 = self.up3(up2, down1)
 
-        up1 = self.up1(thro, down3, context) + temb
-        up2 = self.up2(up1, down2, context)
-        up3 = self.up3(up2, down1)
-
-        out = self.out(torch.cat((up3, x), 1))
-
+            out = self.out(torch.cat((up3, x), 1))
         return out
